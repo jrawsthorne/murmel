@@ -22,7 +22,7 @@
 //!
 //!
 
-use bitcoin::network::constants::Network;
+use bitcoin::network::constants::{ServiceFlags, Network};
 use log::{info, trace};
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -42,12 +42,20 @@ const TEST_SEEDER: [&str;4] = [
 ];
 
 
-pub fn dns_seed (network: Network) -> Vec<SocketAddr> {
+pub fn dns_seed (network: Network, required_services: Option<ServiceFlags>) -> Vec<SocketAddr> {
+
+    let full_host = |host: &str, port: u16| -> String {
+       match required_services {
+           Some(required_services) => format!("x{}.{}:{}", required_services.as_u64(), host, port),
+           None => format!("{}:{}", host, port)
+       }
+    };
+
     let mut seeds = Vec::new ();
     if network == Network::Bitcoin {
         info!("reaching out for DNS seed...");
         for seedhost in MAIN_SEEDER.iter() {
-            if let Ok(lookup) = (*seedhost, 8333).to_socket_addrs() {
+            if let Ok(lookup) = full_host(seedhost, 8333).to_socket_addrs() {
                 for host in lookup {
                     seeds.push(host);
                 }
@@ -60,7 +68,7 @@ pub fn dns_seed (network: Network) -> Vec<SocketAddr> {
     if network == Network::Testnet {
         info!("reaching out for DNS seed...");
         for seedhost in TEST_SEEDER.iter() {
-            if let Ok(lookup) = (*seedhost, 18333).to_socket_addrs() {
+            if let Ok(lookup) = full_host(seedhost, 18333).to_socket_addrs() {
                 for host in lookup {
                     seeds.push(host);
                 }

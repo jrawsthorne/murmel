@@ -157,7 +157,7 @@ impl<Message: Send + Sync + Clone> P2PControlSender<Message> {
 
 #[derive(Clone)]
 pub enum PeerSource {
-    Outgoing(SocketAddr),
+    Outgoing(SocketAddr, ConnectionType),
     Incoming(Arc<TcpListener>)
 }
 
@@ -463,6 +463,21 @@ impl<Message: Version + Send + Sync + Clone,
         self.peers.read().unwrap().len()
     }
 
+    pub fn n_outbound_peers(&self, connection_type: ConnectionType) -> usize {
+        self.peers
+            .read()
+            .unwrap()
+            .values()
+            .filter(|peer| {
+                if let Some(peer_connection_type) = peer.lock().unwrap().connection_type {
+                    peer_connection_type == connection_type
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
     fn control_loop (&self, receiver: P2PControlReceiver<Message>) {
         while let Ok(control) = receiver.recv() {
             match control {
@@ -578,23 +593,24 @@ impl<Message: Version + Send + Sync + Clone,
         let outgoing;
         let addr;
         let stream;
+        let connection_type;
         match source {
-            PeerSource::Outgoing(a) => {
-                if let PeerSource::Outgoing(a) = source {
-                    if peers.read().unwrap().values()
-                        .any(|peer|
-                            if let Ok(addr) = peer.lock().unwrap().stream.peer_addr() {
-                                a.ip() == addr.ip()
-                            } else { false }) {
-                        debug!("rejecting outgoing connect for a peer already connected");
-                        return Err(Error::Handshake);
-                    }
+            PeerSource::Outgoing(a, conn_type) => {
+                
+                if peers.read().unwrap().values()
+                    .any(|peer|
+                        if let Ok(addr) = peer.lock().unwrap().stream.peer_addr() {
+                            a.ip() == addr.ip()
+                        } else { false }) {
+                    debug!("rejecting outgoing connect for a peer already connected");
+                    return Err(Error::Handshake);
                 }
-
+    
                 addr = a;
                 outgoing = true;
                 info!("trying outgoing connect to {} peer={}", addr, pid);
                 stream = TcpStream::connect(&addr)?;
+                connection_type = Some(conn_type);
             },
             PeerSource::Incoming(listener) => {
                 let (s, a) = listener.accept()?;
@@ -611,11 +627,12 @@ impl<Message: Version + Send + Sync + Clone,
                 stream = s;
                 info!("trying incoming connect to {} peer={}", addr, pid);
                 outgoing = false;
+                connection_type = None;
             }
         };
 
         // create lock protected peer object
-        let peer = Mutex::new(Peer::new(pid, stream, poll.clone(), outgoing)?);
+        let peer = Mutex::new(Peer::new(pid, stream, poll.clone(), outgoing, connection_type)?);
 
         let mut peers = peers.write().unwrap();
 
@@ -675,7 +692,7 @@ impl<Message: Version + Send + Sync + Clone,
         }
     }
 
-    fn event_processor (&self, event: Event, pid: PeerId, needed_services: ServiceFlags, iobuf: &mut [u8]) -> Result<(), Error> {
+    fn event_processor (&self, event: Event, pid: PeerId, iobuf: &mut [u8]) -> Result<(), Error> {
         let readiness = UnixReady::from(event.readiness());
         // check for error first
         if readiness.is_hup() || readiness.is_error() {
@@ -792,8 +809,15 @@ impl<Message: Version + Send + Sync + Clone,
                                                 debug!("rejecting to connect to myself peer={}", pid);
                                                 break;
                                             } else {
-                                                if version.version < self.config.min_protocol_version() || !version.services.has(needed_services) {
-                                                    debug!("rejecting peer of version {} and services {} peer={}", version.version, version.services, pid);
+
+                                                let required_services = match locked_peer.connection_type {
+                                                    Some(ConnectionType::Block) => ServiceFlags::NETWORK,
+                                                    Some(ConnectionType::Filter) => ServiceFlags::COMPACT_FILTERS,
+                                                    None => ServiceFlags::NONE
+                                                } | ServiceFlags::WITNESS;
+
+                                                if version.version < self.config.min_protocol_version() || !version.services.has(required_services) {
+                                                    debug!("rejecting peer of version {} and services {} peer={} required_version={} required_services={}", version.version, version.services, pid, self.config.min_protocol_version(), required_services);
                                                     disconnect = true;
                                                     break;
                                                 } else {
@@ -899,7 +923,7 @@ impl<Message: Version + Send + Sync + Clone,
     /// run the message dispatcher loop
     /// this method does not return unless there is an error obtaining network events
     /// run in its own thread, which will process all network events
-    pub fn poll_events(&self, network: &'static str, needed_services: ServiceFlags, spawn: &mut dyn Spawn) {
+    pub fn poll_events(&self, network: &'static str, spawn: &mut dyn Spawn) {
         // events buffer
         let mut events = Events::with_capacity(EVENT_BUFFER_SIZE);
         // IO buffer
@@ -918,7 +942,7 @@ impl<Message: Version + Send + Sync + Clone,
                 } else {
                     // construct the id of the peer the event concerns
                     let pid = PeerId { network, token: event.token() };
-                    if let Err(error) = self.event_processor(event, pid, needed_services, iobuf.as_mut_slice()) {
+                    if let Err(error) = self.event_processor(event, pid, iobuf.as_mut_slice()) {
                         use std::error::Error;
 
                         debug!("error {:?} peer={}", error.source(), pid);
@@ -964,16 +988,24 @@ struct Peer<Message> {
     // ban score
     ban: u32,
     // outgoing or incoming connection
-    outgoing: bool
+    outgoing: bool,
+    // block or filter connection
+    connection_type: Option<ConnectionType>
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ConnectionType {
+    Block,
+    Filter
 }
 
 impl<Message> Peer<Message> {
     /// create a new peer
-    pub fn new (pid: PeerId, stream: TcpStream, poll: Arc<Poll>, outgoing: bool) -> Result<Peer<Message>, Error> {
+    pub fn new (pid: PeerId, stream: TcpStream, poll: Arc<Poll>, outgoing: bool, connection_type: Option<ConnectionType>) -> Result<Peer<Message>, Error> {
         let (sender, receiver) = mpsc::channel();
         let peer = Peer{pid, poll: poll.clone(), stream, read_buffer: Buffer::new(), write_buffer: Buffer::new(),
             got_verack: false, version: None, sender, receiver, writeable: AtomicBool::new(false),
-            connected: false, ban: 0, outgoing };
+            connected: false, ban: 0, outgoing, connection_type };
         Ok(peer)
     }
 

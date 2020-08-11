@@ -32,18 +32,14 @@ use futures::{
     executor::{ThreadPool, ThreadPoolBuilder},
     future,
     Poll as Async,
-    FutureExt, StreamExt,
-    task::{SpawnExt, Context},
-    Future
+    FutureExt,
+    task::{SpawnExt},
 };
-use std::pin::Pin;
-use futures_timer::Interval;
 use crate::headerdownload::HeaderDownload;
 use crate::p2p::{P2P, P2PControl, PeerMessageSender, PeerSource};
 use crate::ping::Ping;
 use rand::{RngCore, thread_rng};
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     path::Path,
     sync::{Arc, mpsc, Mutex, RwLock, atomic::AtomicUsize},
@@ -52,7 +48,7 @@ use crate::timeout::Timeout;
 use crate::downstream::{DownStreamDummy, SharedDownstream};
 use bitcoin::network::message::NetworkMessage;
 use bitcoin::network::message::RawNetworkMessage;
-use crate::p2p::BitcoinP2PConfig;
+use crate::{addrman::AddressManager, p2p::{ConnectionType, BitcoinP2PConfig}};
 use std::time::Duration;
 
 const MAX_PROTOCOL_VERSION: u32 = 70001;
@@ -123,23 +119,27 @@ impl Constructor {
         let mut executor = ThreadPoolBuilder::new().name_prefix("bitcoin-connect").pool_size(2).create().expect("can not start futures thread pool");
 
         let p2p = self.p2p.clone();
+
+        // manual connections should support compact filters
         for addr in &peers {
-            executor.spawn(p2p.add_peer("bitcoin", PeerSource::Outgoing(addr.clone())).map(|_|())).expect("can not spawn task for peers");
+            executor.spawn(p2p.add_peer("bitcoin", PeerSource::Outgoing(addr.clone(), ConnectionType::Filter)).map(|_|())).expect("can not spawn task for peers");
         }
 
-        let keep_connected = KeepConnected {
-            min_connections, p2p: self.p2p.clone(),
-            earlier: HashSet::new(),
-            dns: dns_seed(network),
-            cex: executor.clone()
+        let mut keep_connected = KeepConnected {
+            min_block_connections: min_connections,
+            min_filter_connections: min_connections,
+            p2p: self.p2p.clone(),
+            address_manager: AddressManager::new(),
+            cex: executor.clone(),
+            network,
         };
-        executor.spawn(Interval::new(Duration::new(10, 0)).for_each(move |_| keep_connected.clone())).expect("can not keep connected");
+        
+        std::thread::spawn(move || keep_connected.run());
 
         let p2p = self.p2p.clone();
         let mut cex = executor.clone();
         executor.run(future::poll_fn(move |_| {
-            let needed_services = ServiceFlags::NONE;
-            p2p.poll_events("bitcoin", needed_services, &mut cex);
+            p2p.poll_events("bitcoin", &mut cex);
             Async::Ready(())
         }));
         Ok(())
@@ -149,26 +149,62 @@ impl Constructor {
 #[derive(Clone)]
 struct KeepConnected {
     cex: ThreadPool,
-    dns: Vec<SocketAddr>,
-    earlier: HashSet<SocketAddr>,
+    address_manager: AddressManager,
     p2p: Arc<P2P<NetworkMessage, RawNetworkMessage, BitcoinP2PConfig>>,
-    min_connections: usize
+    min_block_connections: usize,
+    min_filter_connections: usize,
+    network: Network
 }
 
-impl Future for KeepConnected {
-    type Output = ();
+impl KeepConnected {
+    pub fn run(&mut self) {
 
-    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Async<Self::Output> {
-        if self.p2p.n_connected_peers() < self.min_connections {
-            let eligible = self.dns.iter().cloned().filter(|a| !self.earlier.contains(a)).collect::<Vec<_>>();
-            if eligible.len() > 0 {
-                let mut rng = thread_rng();
-                let choice = eligible[(rng.next_u32() as usize) % eligible.len()];
-                self.earlier.insert(choice.clone());
-                let add = self.p2p.add_peer("bitcoin", PeerSource::Outgoing(choice)).map(|_| ());
-                self.cex.spawn(add).expect("can not add peer for outgoing connection");
-            }
+        let filter_addrs = dns_seed(self.network, Some(ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS));
+        let block_addrs = dns_seed(self.network, Some(ServiceFlags::WITNESS | ServiceFlags::NETWORK));
+
+        for addr in filter_addrs {
+            self.address_manager.add(addr, ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS);
         }
-        Async::Ready(())
+
+        for addr in block_addrs {
+            self.address_manager.add(addr, ServiceFlags::WITNESS | ServiceFlags::NETWORK);
+        }
+
+        loop {
+            let block_needed = self
+                .min_block_connections
+                .saturating_sub(self.p2p.n_outbound_peers(ConnectionType::Block));
+
+            let filter_needed = self
+                .min_block_connections
+                .saturating_sub(self.p2p.n_outbound_peers(ConnectionType::Filter));
+
+            for _ in 0..block_needed {
+                self.add_peer(ConnectionType::Block);
+            }
+
+            for _ in 0..filter_needed {
+                self.add_peer(ConnectionType::Filter);
+            }
+
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+
+    fn add_peer(&mut self, connection_type: ConnectionType) {
+        let addr = match connection_type {
+            ConnectionType::Block => self.address_manager.get_full_block_addr(),
+            ConnectionType::Filter => self.address_manager.get_compact_filter_addr()
+        };
+        if let Some(addr) = addr {
+            let add = self
+                .p2p
+                .add_peer("bitcoin", PeerSource::Outgoing(addr, connection_type))
+                .map(|_| ());
+            self
+                .cex
+                .spawn(add)
+                .expect("can not add peer for outgoing connection");
+        }
     }
 }

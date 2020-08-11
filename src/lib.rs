@@ -38,5 +38,6 @@ pub mod p2p;
 pub mod error;
 pub mod chaindb;
 pub mod constructor;
+pub mod addrman;
 
 pub use error::Error;
